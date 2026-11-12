@@ -1,0 +1,48 @@
+{
+  "waybill_table": "waybills",
+  "waybill_column": "waybill_id",
+  "waybill_ids": ["WB1001", "WB1002", "WB1003", "WB9999"],
+  "sources": [
+    {
+      "name": "waybills",
+      "columns": [
+        {"name": "waybill_id", "type": "VARCHAR"},
+        {"name": "receiver_zip", "type": "VARCHAR"},
+        {"name": "city_id", "type": "INTEGER"},
+        {"name": "signed_status", "type": "VARCHAR"}
+      ],
+      "rows": [
+        ["WB1001", "100000", 1, "已签收"],
+        ["WB1002", "100001", 2, "已签收"],
+        ["WB1003", "100002", 3, "已签收"]
+      ]
+    },
+    {
+      "name": "dim_delivery_zone",
+      "columns": [
+        {"name": "zip_code", "type": "VARCHAR"},
+        {"name": "zone_name", "type": "VARCHAR"}
+      ],
+      "rows": [
+        ["100000", "远郊A区"],
+        ["100000", "远郊B区"],
+        ["100001", "核心区"],
+        ["100001", "核心区备站"]
+      ]
+    }
+  ],
+  "models": [
+    {
+      "name": "stg_waybill",
+      "sql": "SELECT w.waybill_id,\n       w.receiver_zip AS zip,\n       w.city_id\nFROM waybills w\nWHERE w.receiver_zip IS NOT NULL"
+    },
+    {
+      "name": "dwd_delivery_fact",
+      "sql": "SELECT s.zip,\n       z.zone_name,\n       s.city_id\nFROM stg_waybill s\nJOIN dim_delivery_zone z ON s.zip = z.zip_code"
+    },
+    {
+      "name": "ads_delivery_daily",
+      "sql": "SELECT f.zone_name,\n       f.city_id\nFROM dwd_delivery_fact f\nWHERE f.city_id >= 2"
+    }
+  ]
+}

@@ -1,6 +1,13 @@
 # 配送数仓列依赖分析服务
 
-运单源表即将停供旧邮编列。本服务接收源表定义、各模型的 DuckDB SELECT 与待下线源列，
+两个接口：
+
+- `POST /analyze`：待下线源列的跨模型列依赖分析（只解析、不执行 SQL）；
+- `POST /locate-missing`：配送日报漏单定位（内存 DuckDB 只读试算，逐票追踪行数）。
+
+## POST /analyze：列依赖分析
+
+运单源表即将停供旧邮编列。本接口接收源表定义、各模型的 DuckDB SELECT 与待下线源列，
 **只用 SQLGlot 解析、不执行任何 SQL**，沿别名、普通星号与非递归 CTE 跨模型追踪列引用，
 按模型输出：
 
@@ -40,7 +47,8 @@ docker compose up --build
 # OpenAPI: http://localhost:8000/openapi.json
 ```
 
-Swagger 的 `POST /analyze` 请求体自带"邮编改名后仍用于筛选"的样例，可直接 Try it out。
+Swagger 的 `POST /analyze` 请求体自带"邮编改名后仍用于筛选"的样例，
+`POST /locate-missing` 自带"维表一对多、运单到下游才被筛掉"的样例，均可直接 Try it out。
 
 ## 请求示例
 
@@ -100,13 +108,57 @@ curl -X POST http://localhost:8000/analyze \
 错误响应统一为 `400`，`detail` 是数组，每项含 `model`、`location`、`message`，
 一次返回收集到的全部问题。
 
+# 漏单定位 API（POST /locate-missing）
+
+配送日报漏了已签收的运单时，值班员提交**待查运单号**、**同批源表样本**和
+**按执行顺序给出的模型 SQL**，服务把同批运单放进**一次内存 DuckDB 试算**
+（只读提交的样本、不落盘、每请求独立连接），逐票返回源表及每次 JOIN、
+WHERE 之后的行数，据此判断该补源数据还是查连接和筛选。
+
+## 输入规则
+
+- `waybill_table` / `waybill_column`：运单源表名与运单号列；`waybill_ids` 为待查运单号。
+- `sources`：同批源表样本（运单源表 + 源维表）。每表附 `columns`（列名 + 类型，
+  **只用 INTEGER 和 VARCHAR**）和按列顺序取值的 `rows`（`null` 表示 NULL）。
+- `models`：按执行顺序排列。首个模型的 `FROM` 必须是运单源表，之后每个模型
+  逐级读取前一模型。模型 SQL 只支持：
+  - 直接选列及改名（`列` 或 `列 AS 别名`，**不去重**，不支持星号与表达式）；
+  - 与**源维表**做等值 `INNER JOIN` / `LEFT JOIN`（`ON 列 = 列`，可用 `AND` 连接）；
+  - `WHERE` 比较（`= != <> < <= > >=`，列与常量或列与列）或判空（`IS NULL` /
+    `IS NOT NULL`），可用 `AND` / `OR` 组合。
+- 条件列（`JOIN ON` 与 `WHERE`）必须带表名或别名；中间模型可以不输出运单号
+  （内部用携带列逐票追踪）。
+
+## 输出（逐票）
+
+- `status`：`missing_in_source`（源表缺票，单独标记）/ `dropped_in_pipeline`
+  （中途归零）/ `not_missing`（最后仍有行，未漏单）。
+- `steps`：源表（`SOURCE`）及每次 `JOIN`、每个 `WHERE` 之后的行数，按执行顺序；
+  维表一对多等**重复匹配照计**（行数可变多）。
+- `first_zero`：仅 `dropped_in_pipeline` 时给出首次归零的模型与子句。
+- `final_rows`：最后一个模型输出中该运单的行数。
+
+样本或 SQL 有误时返回 `400` 并说明原因（`detail` 数组，可含多条），**不给部分报告**。
+`steps[].detail` 为 sqlglot 归一化后的 SQL 片段（如 `IS NOT NULL` 会显示为
+`NOT ... IS NULL`，语义相同）。
+
+```bash
+curl -X POST http://localhost:8000/locate-missing \
+  -H 'Content-Type: application/json' \
+  --data @examples/request_missing_waybills.json
+```
+
+`examples/request_missing_waybills.json`（同 Swagger 内置样例）覆盖：维表一对多、
+运单 WB1001 到下游 `ads_delivery_daily` 才被筛掉、WB1003 在 INNER JOIN 处掉单、
+WB9999 源表缺票、WB1002 未漏单且重复匹配照计（`final_rows = 2`）。
+
 ## 本地开发（不用 Docker）
 
 ```bash
 python -m venv --without-pip .venv   # 若系统带 ensurepip 可直接 python -m venv .venv
 .venv/bin/pip install -r requirements.txt
 PYTHONPATH=. .venv/bin/uvicorn app.main:app --reload
-.venv/bin/pytest                       # 37 个测试
+.venv/bin/pytest                       # 68 个测试
 ```
 
 ## 目录
@@ -115,7 +167,8 @@ PYTHONPATH=. .venv/bin/uvicorn app.main:app --reload
 app/
   main.py        FastAPI 路由、请求/响应模型、Swagger 样例与入参校验
   lineage.py     SQLGlot 解析与列级血缘分析（不执行 SQL）
-  tests/         分析器与 API 测试
-examples/        邮编改名场景的完整请求样例
+  missing.py     漏单定位：内存 DuckDB 共享试算与逐票行数追踪
+  tests/         分析器、漏单定位与 API 测试
+examples/        邮编改名场景与漏单定位场景的完整请求样例
 Dockerfile, docker-compose.yml, requirements.txt
 ```
